@@ -28,6 +28,9 @@ class VarianceSwapData:
     days_in_year: int = 365
     dt: float = 1.0 / 252.0
 
+    vega_bump: float = 0.001 # -> smaller values could be smalller than the random noise and bigger values might make the vega estimate worse
+    rho_bump: float = 0.0001 # -> this is on bp (1/10) of one percent - it is standart to calcualte changes in price in one basis point
+
 def create_variance_swap(sigma_strike=0.20, 
                          vega_notional=1.0, 
                          current_vol_env=0.15, 
@@ -108,6 +111,38 @@ def get_drift(data: VarianceSwapData, r_param=None, vol_param=None):
     vol = vol_param if vol_param is not None else data.current_vol_env
     return (r - 0.5 * vol**2) * data.dt
 
+# analytical 
+def run_analytical_results(data: VarianceSwapData):
+    def get_analytical_future(d, v=None):
+        vol = v if v else d.current_vol_env
+        return d.num_future * (vol**2 / d.b_days_in_year)
+
+    past = get_analytical_past_variance(data)
+    future = get_analytical_future(data)
+    val = calculate_final_price(data, past, future)
+    
+    days_to_mat = (data.trading_days[-1] - data.valuation_date).days
+    rho = -(days_to_mat/data.days_in_year) * val
+
+    df = np.exp(-data.risk_free_rate * (days_to_mat/data.days_in_year))
+    weight = data.num_future / data.total_days
+    vega = df * data.variance_notional * weight * (2 * data.current_vol_env)
+
+    data_tom = get_tomorrow_swap_data(data)
+    past_tom = get_analytical_past_variance(data_tom)
+    future_tom = get_analytical_future(data_tom)
+    price_tom = calculate_final_price(data_tom, past_tom, future_tom)
+    theta = price_tom - val
+
+    return {
+        "price": val, 
+        "delta": 0, 
+        "gamma": 0, 
+        "rho": rho, 
+        "vega": vega, 
+        "theta": theta
+    }
+
 # monte carlo under gbm
 def get_mc_gbm_sum_sq_return(data: VarianceSwapData, Z_matrix, vol_param=None, r_param=None):
     vol_param = vol_param if vol_param is not None else data.current_vol_env
@@ -119,25 +154,24 @@ def get_mc_gbm_sum_sq_return(data: VarianceSwapData, Z_matrix, vol_param=None, r
     return np.mean(future_sum_sq)
 
 def run_gbm_mc_greeks(data: VarianceSwapData, n_simulations=50000):
-    # Generate random numbers once
+    # generate random numbers once
     Z_common = np.random.normal(0, 1, (n_simulations, data.num_future))
 
     sum_sq_past = get_analytical_past_variance(data)
     sum_sq_future_base = get_mc_gbm_sum_sq_return(data, Z_common)
     current_val = calculate_final_price(data, sum_sq_past, sum_sq_future_base)
 
-    bump = 0.001
-    future_up = get_mc_gbm_sum_sq_return(data, Z_common, vol_param=data.current_vol_env + bump)
-    future_down = get_mc_gbm_sum_sq_return(data, Z_common, vol_param=data.current_vol_env - bump)
+    future_up = get_mc_gbm_sum_sq_return(data, Z_common, vol_param=data.current_vol_env + data.vega_bump)
+    future_down = get_mc_gbm_sum_sq_return(data, Z_common, vol_param=data.current_vol_env - data.vega_bump)
     p_up = calculate_final_price(data, sum_sq_past, future_up)
     p_down = calculate_final_price(data, sum_sq_past, future_down)
-    vega = (p_up - p_down) / (2 * bump)
+    vega = (p_up - p_down) / (2 * data.vega_bump)
     
-    future_r_up = get_mc_gbm_sum_sq_return(data, Z_common, r_param=data.risk_free_rate + 0.0001)
-    future_r_down = get_mc_gbm_sum_sq_return(data, Z_common, r_param=data.risk_free_rate - 0.0001)
-    p_r_up = calculate_final_price(data, sum_sq_past, future_r_up, r_param=data.risk_free_rate + 0.0001)
-    p_r_down = calculate_final_price(data, sum_sq_past, future_r_down, r_param=data.risk_free_rate - 0.0001)
-    rho = (p_r_up - p_r_down) / (2 * 0.0001)
+    future_r_up = get_mc_gbm_sum_sq_return(data, Z_common, r_param=data.risk_free_rate + data.rho_bump)
+    future_r_down = get_mc_gbm_sum_sq_return(data, Z_common, r_param=data.risk_free_rate - data.rho_bump)
+    p_r_up = calculate_final_price(data, sum_sq_past, future_r_up, r_param=data.risk_free_rate + data.rho_bump)
+    p_r_down = calculate_final_price(data, sum_sq_past, future_r_down, r_param=data.risk_free_rate - data.rho_bump)
+    rho = (p_r_up - p_r_down) / (2 * data.rho_bump)
 
     data_tomorrow = get_tomorrow_swap_data(data)
     Z_tomorrow = Z_common[:, 1:] 
@@ -155,12 +189,12 @@ def run_gbm_mc_greeks(data: VarianceSwapData, n_simulations=50000):
         "theta": theta 
     }
 
-# heston 
+# heston
 # analytical heston
 def run_heston_analytical_results(data: VarianceSwapData):
     def get_heston_expected_future_var(d, init_var=None):
         init_var = init_var if init_var is not None else (d.current_vol_env**2)
-        T_future = d.num_future / d.b_days_in_year # annualized time to maturity
+        T_future = d.num_future / d.b_days_in_year # time to maturity in years
         if T_future == 0: return 0.0
         lt_anchor = d.theta * T_future # if we wait a one year, we expect the variance to be theta
         diff_var = init_var - d.theta # diffrence in the initial variance and suppoasbly where the variance will be in the future 
@@ -172,18 +206,17 @@ def run_heston_analytical_results(data: VarianceSwapData):
     future = get_heston_expected_future_var(data)
     val = calculate_final_price(data, past, future)
 
-    days_to_mat = (data.trading_days[-1] - data.valuation_date).days
-    rho = -(days_to_mat/365.0) * val
-    
-    bump = 0.001
-    v0_up = (data.current_vol_env + bump)**2
-    v0_down = (data.current_vol_env - bump)**2
-    
+    p_r_up = calculate_final_price(data, past, future, r_param=data.risk_free_rate + data.rho_bump)
+    p_r_down = calculate_final_price(data, past, future, r_param=data.risk_free_rate - data.rho_bump)    
+    rho = (p_r_up - p_r_down) / (2 * data.rho_bump)
+
+    v0_up = (data.current_vol_env + data.vega_bump)**2
+    v0_down = (data.current_vol_env - data.vega_bump)**2
     future_up = get_heston_expected_future_var(data, init_var=v0_up)
     future_down = get_heston_expected_future_var(data, init_var=v0_down)
     p_up = calculate_final_price(data, past, future_up)
     p_down = calculate_final_price(data, past, future_down)
-    vega = (p_up - p_down) / (2 * bump)
+    vega = (p_up - p_down) / (2 * data.vega_bump)
 
     data_tom = get_tomorrow_swap_data(data)
     past_tom = get_analytical_past_variance(data_tom)
@@ -212,9 +245,6 @@ def get_mc_heston_sum_sq_return(data: VarianceSwapData, Z_S, Z_v, v0_param=None,
     sqrt_dt = np.sqrt(data.dt)
     
     corr_compl = np.sqrt(1 - data.rho**2) # correlation complement comes from Cholesky Decomposition, it shows how much the Stock depends on itself while rho shows how much it depends on the variance
-    # TODO: move this explanation 
-    # Cholesky Decomposition - with lieanr algebra look for matrix that when multiplied by transpose of itself gives the correlation matrix that is [[1, rho], [rho, 1]]
-    # the matrix is [[1, rho], [0, corr_compl]]
     for i in range(n_steps):
         z_v_step = Z_v[:, i]
         z_s_step = Z_S[:, i]
@@ -244,8 +274,7 @@ def get_mc_heston_sum_sq_return(data: VarianceSwapData, Z_S, Z_v, v0_param=None,
 
     return np.mean(total_sq_returns)
 
-def run_heston_mc_greeks(data: VarianceSwapData, n_simulations=20000):
-    np.random.seed(42)
+def run_heston_mc_greeks(data: VarianceSwapData, n_simulations=20_000):
     Z_S_common = np.random.normal(0, 1, (n_simulations, data.num_future))
     Z_v_common = np.random.normal(0, 1, (n_simulations, data.num_future))
 
@@ -254,20 +283,19 @@ def run_heston_mc_greeks(data: VarianceSwapData, n_simulations=20000):
     sum_sq_future_base = get_mc_heston_sum_sq_return(data, Z_S_common, Z_v_common)
     current_val = calculate_final_price(data, sum_sq_past, sum_sq_future_base)
 
-    bump = 0.001
-    v0_up = (data.current_vol_env + bump)**2
-    v0_down = (data.current_vol_env - bump)**2
+    v0_up = (data.current_vol_env + data.vega_bump)**2
+    v0_down = (data.current_vol_env - data.vega_bump)**2
     future_up = get_mc_heston_sum_sq_return(data, Z_S_common, Z_v_common, v0_param=v0_up)
     future_down = get_mc_heston_sum_sq_return(data, Z_S_common, Z_v_common, v0_param=v0_down)
     p_up = calculate_final_price(data, sum_sq_past, future_up)
     p_down = calculate_final_price(data, sum_sq_past, future_down)
-    vega = (p_up - p_down) / (2 * bump)
+    vega = (p_up - p_down) / (2 * data.vega_bump)
     
-    future_r_up = get_mc_heston_sum_sq_return(data, Z_S_common, Z_v_common, r_param=data.risk_free_rate + 0.0001)
-    future_r_down = get_mc_heston_sum_sq_return(data, Z_S_common, Z_v_common, r_param=data.risk_free_rate - 0.0001)
-    p_r_up = calculate_final_price(data, sum_sq_past, future_r_up, r_param=data.risk_free_rate + 0.0001)
-    p_r_down = calculate_final_price(data, sum_sq_past, future_r_down, r_param=data.risk_free_rate - 0.0001)
-    rho_val = (p_r_up - p_r_down) / (2 * 0.0001)
+    future_r_up = get_mc_heston_sum_sq_return(data, Z_S_common, Z_v_common, r_param=data.risk_free_rate + data.rho_bump)
+    future_r_down = get_mc_heston_sum_sq_return(data, Z_S_common, Z_v_common, r_param=data.risk_free_rate - data.rho_bump)
+    p_r_up = calculate_final_price(data, sum_sq_past, future_r_up, r_param=data.risk_free_rate + data.rho_bump)
+    p_r_down = calculate_final_price(data, sum_sq_past, future_r_down, r_param=data.risk_free_rate - data.rho_bump)
+    rho_val = (p_r_up - p_r_down) / (2 * data.rho_bump)
 
     data_tomorrow = get_tomorrow_swap_data(data)
     Z_S_tomorrow = Z_S_common[:, 1:] 
@@ -284,36 +312,4 @@ def run_heston_mc_greeks(data: VarianceSwapData, n_simulations=20000):
         "rho": rho_val,   
         "vega": vega, 
         "theta": theta 
-    }
-
-# analytical 
-def run_analytical_results(data: VarianceSwapData):
-    def get_analytical_future(d, v=None):
-        vol = v if v else d.current_vol_env
-        return d.num_future * (vol**2 / d.b_days_in_year)
-
-    past = get_analytical_past_variance(data)
-    future = get_analytical_future(data)
-    val = calculate_final_price(data, past, future)
-    
-    days_to_mat = (data.trading_days[-1] - data.valuation_date).days
-    rho = -(days_to_mat/365.0) * val
-
-    df = np.exp(-data.risk_free_rate * (days_to_mat/365.0))
-    weight = data.num_future / data.total_days
-    vega = df * data.variance_notional * weight * (2 * data.current_vol_env)
-
-    data_tom = get_tomorrow_swap_data(data)
-    past_tom = get_analytical_past_variance(data_tom)
-    future_tom = get_analytical_future(data_tom)
-    price_tom = calculate_final_price(data_tom, past_tom, future_tom)
-    theta = price_tom - val
-    
-    return {
-        "price": val, 
-        "delta": 0, 
-        "gamma": 0, 
-        "rho": rho, 
-        "vega": vega, 
-        "theta": theta
     }
